@@ -117,6 +117,3 @@ temporary build-related artifacts.
 
 * New Alpine Linux *versions* are currently not auto-detected and added as a
   core version profile; this process is, at the moment, still a manual task.
-
-* Although it's possible to build "aarch64" (arm64) AMIs, they don't quite work
-  yet.

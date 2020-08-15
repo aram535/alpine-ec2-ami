@@ -459,12 +459,24 @@ class ConfigBuilder:
         return datetime.fromisoformat(input).isoformat(timespec="seconds")
 
     @classmethod
-    def resolve_tomorrow(cls, input):
+    def resolve_now(cls):
+        return cls.now.strftime("%Y%m%d%H%M%S")
+
+    @classmethod
+    def resolve_revision(cls, input):
+        if input is None or input == "":
+            return cls.resolve_now()
+        return input
+
+    @classmethod
+    def resolve_tomorrow(cls):
         return cls.tomorrow.isoformat(timespec="seconds")
 
     @classmethod
-    def resolve_now(cls, input):
-        return cls.now.strftime("%Y%m%d%H%M%S")
+    def resolve_end_of_life(cls, input):
+        if input is None or input == "":
+            return cls.resolve_tomorrow()
+        return input
 
     @classmethod
     def fold_comma(cls, input):
@@ -503,9 +515,9 @@ class ConfigBuilder:
             "repos"           : self.fold_repos,
             "pkgs"            : self.fold_packages,
             "svcs"            : self.fold_services,
-            "revision"        : self.resolve_now,
+            "revision"        : self.resolve_revision,
             "end_of_life"     : lambda x: \
-                self.force_iso_date(self.resolve_tomorrow(x)),
+                self.force_iso_date(self.resolve_end_of_life(x)),
         }
 
     def build_all(self):
