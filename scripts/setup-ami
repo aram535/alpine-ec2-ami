@@ -154,7 +154,8 @@ install_core_packages() {
 }
 
 setup_mdev() {
-    cp /tmp/setup-ami.d/nvme-ebs-links "$TARGET/lib/mdev"
+    install -o root -g root -Dm755 -t "$TARGET/lib/mdev" \
+        /tmp/setup-ami.d/nvme-ebs-links
 
     # insert nvme ebs mdev configs just above "# fallback" comment
     sed -n -i \
