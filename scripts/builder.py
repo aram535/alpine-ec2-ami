@@ -54,6 +54,12 @@ import boto3
 import pyhocon
 
 
+# This is an ugly hack. We occasionally need the region name but it's not
+# attached to anything publicly exposed on the client objects. Hide this here.
+def region_from_client(client):
+    return client._client_config.region_name
+
+
 class EC2Architecture(Enum):
 
     I386 = "i386"
@@ -891,6 +897,201 @@ class UpdateReleases:
 
         with open(release_yaml, "w") as data:
             yaml.dump(releases, data, sort_keys=False)
+
+
+class ReleaseAMIs:
+    """Copy AMIs to other regions and optionally make them public.
+
+    Copies an AMI from a source region to destination regions. If the AMI
+    exists in some regions but not others it will copy only to the new regions.
+    This copy will add tags to the destination AMIs to link them to the source
+    AMI.
+
+    By default does not make the AMIs public. Running the command a second time
+    with the --public flag will make the already copied AMIs public. If some
+    AMIs are public and others are not, will make them all public.
+
+    This command will fill in missing regions and synchronized public settings
+    if it's re-run with the same AMI ID as new regions are added.
+    """
+
+    command_name = "release"
+
+    @staticmethod
+    def add_args(parser):
+        parser.add_argument("--use-broker", action="store_true",
+            help="use identity broker to obtain per-region credentials")
+        parser.add_argument("--public", action="store_true",
+            help="make all copied images public, even previously copied ones")
+        parser.add_argument("--source-region", default="us-west-2",
+            help="source region hosting ami to copy")
+        parser.add_argument("--region", "-r", action="append",
+            help="destination regions for copy, may be specified multiple "
+            "times")
+        parser.add_argument("--allow-accounts", action="append",
+            help="add permissions for other accounts to non-public images, "
+            "may be specified multiple times")
+        parser.add_argument("--out-file", "-o",
+            help="output file for JSON AMI map, otherwise stdout")
+        parser.add_argument("ami", help="ami id to copy")
+
+    @staticmethod
+    def check_args(args):
+        if not args.use_broker and not args.region:
+            return ["Use broker or region must be specified"]
+
+        if args.use_broker and args.region:
+            return ["Broker and region flags are mutually exclusive."]
+
+        if args.out_file and os.path.exists(args.out_file):
+            return ["Output file already exists"]
+
+    def get_source_region_client(self, use_broker, source_region):
+        if use_broker:
+            return IdentityBrokerClient().boto3_session_for_region(
+                source_region).client("ec2")
+        else:
+            return boto3.session.Session(region_name=source_region).client(
+                "ec2")
+
+    def iter_regions(self, use_broker, regions):
+        if use_broker:
+            for region in IdentityBrokerClient().iter_regions():
+                yield region.client("ec2")
+            return
+
+        for region in regions:
+            yield boto3.session.Session(region_name=region).client("ec2")
+
+    def get_image(self, client, image_id):
+        images = client.describe_images(ImageIds=[image_id], Owners=["self"])
+        perms = client.describe_image_attribute(
+            Attribute="launchPermission", ImageId=image_id)
+
+        ami = AMI.from_aws_model(
+            images["Images"][0], region_from_client(client))
+        ami.aws_permissions = perms["LaunchPermissions"]
+
+        return ami
+
+    def get_image_with_tags(self, client, **tags):
+        images = self.get_images_with_tags(client, **tags)
+        if len(images) > 1:
+            raise Exception(f"Too many images for query {tags!r}")
+        elif len(images) == 0:
+            return None
+        else:
+            return images[0]
+
+    def get_images_with_tags(self, client, **tags):
+        images = []
+
+        res = client.describe_images(Owners=["self"], Filters=[
+            {"Name": f"tag:{k}", "Values": [v]} for k, v in tags.items()])
+
+        for image in res["Images"]:
+            ami = AMI.from_aws_model(image, region_from_client(client))
+            perms = client.describe_image_attribute(
+                Attribute="launchPermission", ImageId=ami.image_id)
+            ami.aws_permissions = perms["LaunchPermissions"]
+            images.append(ami)
+
+        return images
+
+    def copy_image(self, from_client, to_client, image_id):
+        source = self.get_image(from_client, image_id)
+
+        res = to_client.copy_image(
+            Name=source.name, Description=source.description,
+            SourceImageId=source.image_id, SourceRegion=source.region)
+
+        tags = [{
+            "Key": "source_ami",
+            "Value": source.image_id,
+        }]
+        tags.extend(source.aws_tags)
+
+        to_client.create_tags(Resources=[res["ImageId"]], Tags=tags)
+
+        return self.get_image(to_client, res["ImageId"])
+
+    def has_incorrect_perms(self, ami, accounts, public):
+        if accounts and set(ami.allowed_users) != set(accounts):
+            return True
+
+        if public and not ami.public:
+            return True
+
+    def update_image_permissions(self, client, ami):
+        client.modify_image_attribute(
+            Attribute="launchPermission", ImageId=ami.image_id,
+            LaunchPermission={"Add": ami.aws_permissions})
+
+    def run(self, args, root, log):
+        released = {}
+        pending_copy = []
+        pending_perms = []
+
+        source_client = self.get_source_region_client(
+            args.use_broker, args.source_region)
+
+        # Copy image to regions where it is missing, catalog images that need
+        # permission fixes
+        for client in self.iter_regions(args.use_broker, args.region):
+            region_name = region_from_client(client) # For logging
+
+            # Don't copy to source region
+            if region_name == region_from_client(source_client):
+                continue
+
+            log.info(f"Considering region {region_name}")
+            image = self.get_image_with_tags(client, source_ami=args.ami)
+            if not image:
+                log.info(f"Copying ami {args.ami} from {args.source_region} "
+                         f"to {region_name}")
+                ami = self.copy_image(source_client, client, args.ami)
+                pending_copy.append((client, ami.image_id))
+            elif self.has_incorrect_perms(
+                    image, args.allow_accounts, args.public):
+                log.info(f"Incorrect permissions for ami {args.ami} in region "
+                         f"{region_name}")
+                pending_perms.append((client, image.image_id))
+
+        # Wait for images to copy
+        while pending_copy:
+            client, id = pending_copy.pop(0) # emulate a FIFO queue
+            region_name = region_from_client(client) # For logging
+            image = self.get_image(client, id)
+            if image.state != AMIState.AVAILABLE:
+                log.info(f"Waiting for image copy for {id} to complete "
+                         f"in {region_name}")
+                pending_copy.append((client, id))
+            else:
+                pending_perms.append((client, id))
+                released[region_name] = id
+
+            time.sleep(30)
+
+        # Update all permissions
+        for client, id in pending_perms:
+            region_name = region_from_client(client) # For logging
+
+            log.info(f"Updating permissions on ami {id} in "
+                     f"{region_name}")
+            image = self.get_image(client, id)
+
+            if args.public:
+                image.allowed_groups = ["all"]
+            elif args.allow_accounts:
+                image.allowed_users = args.allow_accounts
+
+            self.update_image_permissions(client, image)
+
+        if args.out_file:
+            with open(args.out_file, "w") as fp:
+                json.dump(released, fp, indent=4)
+        else:
+            json.dump(released, sys.stdout, indent=4)
 
 
 class ConvertPackerJSON:
