@@ -43,6 +43,7 @@ import textwrap
 import subprocess
 import urllib.error
 
+from enum import Enum
 from collections import defaultdict
 from datetime import datetime, timedelta
 from distutils.version import StrictVersion
@@ -51,6 +52,205 @@ from urllib.request import Request, urlopen
 import yaml
 import boto3
 import pyhocon
+
+
+class EC2Architecture(Enum):
+
+    I386 = "i386"
+    X86_64 = "x86_64"
+    ARM64 = "arm64"
+
+
+class AMIState(Enum):
+
+    PENDING = "pending"
+    AVAILABLE = "available"
+    INVALID = "invalid"
+    DEREGISTERED = "deregistered"
+    TRANSIENT = "transient"
+    FAILED = "failed"
+    ERROR = "error"
+
+
+class EC2SnapshotState(Enum):
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+class TaggedAWSObject:
+    """Base class for AWS API models that support tagging
+    """
+
+    EDGE = StrictVersion("0.0")
+
+    missing_known_tags = None
+
+    _identity = lambda x: x
+    _known_tags = {
+        "Name": _identity,
+        "profile":  _identity,
+        "revision":  _identity,
+        "profile_build":  _identity,
+        "source_ami":  _identity,
+        "arch": lambda x: EC2Architecture(x),
+        "end_of_life": lambda x: datetime.fromisoformat(x),
+        "release": lambda v: EDGE if v == "edge" else StrictVersion(v),
+        "version": lambda v: EDGE if v == "edge" else StrictVersion(v),
+    }
+
+    def __repr__(self):
+        attrs = []
+        for k, v in self.__dict__.items():
+            if isinstance(v, TaggedAWSObject):
+                attrs.append(f"{k}=" + object.__repr__(v))
+            elif not k.startswith("_"):
+                attrs.append(f"{k}={v!r}")
+        attrs = ", ".join(attrs)
+
+        return f"{self.__class__.__name__}({attrs})"
+
+    __str__ = __repr__
+
+    @property
+    def aws_tags(self):
+        """Convert python tags to AWS API tags
+
+        See AMI.aws_permissions for rationale.
+        """
+        for key, values in self.tags.items():
+            for value in values:
+                yield { "Key": key, "Value": value }
+
+    @aws_tags.setter
+    def aws_tags(self, values):
+        """Convert AWS API tags to python tags
+
+        See AMI.aws_permissions for rationale.
+        """
+        if not getattr(self, "tags", None):
+            self.tags = {}
+
+        tags = defaultdict(list)
+
+        for tag in values:
+            tags[tag["Key"]].append(tag["Value"])
+
+        self.tags.update(tags)
+        self._transform_known_tags()
+
+    # XXX(mcrute): The second paragraph might be considered a bug and worth
+    # fixing at some point. For now those are all read-only attributes though.
+    def _transform_known_tags(self):
+        """Convert well known tags into python attributes
+
+        Some tags have special meanings for the model objects that they're
+        attached to. This copies those tags, transforms them, then sets them in
+        the model attributes.
+
+        It doesn't touch the tag itself so if that
+        attribute needs updated and re-saved the tag must be updated in
+        addition to the model.
+        """
+        self.missing_known_tags = []
+
+        for k, tf in self._known_tags.items():
+            v = self.tags.get(k, [])
+            if not v:
+                self.missing_known_tags.append(k)
+                continue
+
+            if len(v) > 1:
+                raise Exception(f"multiple instances of tag {k}")
+
+            setattr(self, k, v[0])
+
+
+class AMI(TaggedAWSObject):
+
+    @property
+    def aws_permissions(self):
+        """Convert python permissions to AWS API permissions
+
+        The permissions model for the API makes more sense for a web service
+        but is overly verbose for working with in Python. This and the setter
+        allow transforming to/from the API syntax. The python code should
+        consume the allowed_groups and allowed_users lists directly.
+        """
+        perms = []
+        for g in self.allowed_groups:
+            perms.append({"Group": g})
+
+        for i in self.allowed_users:
+            perms.append({"UserId": i})
+
+        return perms
+
+    @aws_permissions.setter
+    def aws_permissions(self, perms):
+        """Convert AWS API permissions to python permissions
+        """
+        for perm in perms:
+            group = perm.get("Group")
+            if group:
+                self.allowed_groups.append(group)
+
+            user = perm.get("UserId")
+            if user:
+                self.allowed_users.append(user)
+
+    @classmethod
+    def from_aws_model(cls, ob, region):
+        self = cls()
+
+        self.linked_snapshot = None
+        self.allowed_groups = []
+        self.allowed_users = []
+        self.region = region
+        self.architecture = EC2Architecture(ob["Architecture"])
+        self.creation_date = ob["CreationDate"]
+        self.description = ob.get("Description", None)
+        self.image_id = ob["ImageId"]
+        self.name = ob.get("Name")
+        self.owner_id = int(ob["OwnerId"])
+        self.public = ob["Public"]
+        self.state = AMIState(ob["State"])
+        self.virtualization_type = ob["VirtualizationType"]
+        self.state_reason = ob.get("StateReason", {}).get("Message", None)
+        self.aws_tags = ob.get("Tags", [])
+
+        # XXX(mcrute): Assumes we only ever have one device mapping, which is
+        # valid for Alpine AMIs but not a good general assumption.
+        #
+        # This should always resolve for AVAILABLE images but any part of the
+        # data structure may not yet exist for images that are still in the
+        # process of copying.
+        if ob.get("BlockDeviceMappings"):
+            self.snapshot_id = \
+                    ob["BlockDeviceMappings"][0]["Ebs"].get("SnapshotId")
+
+        return self
+
+
+class EC2Snapshot(TaggedAWSObject):
+
+    @classmethod
+    def from_aws_model(cls, ob, region):
+        self = cls()
+
+        self.linked_ami = None
+        self.region = region
+        self.snapshot_id = ob["SnapshotId"]
+        self.description = ob.get("Description", None)
+        self.owner_id = int(ob["OwnerId"])
+        self.progress = int(ob["Progress"].rstrip("%")) / 100
+        self.start_time = ob["StartTime"]
+        self.state = EC2SnapshotState(ob["State"])
+        self.volume_size = ob["VolumeSize"]
+        self.aws_tags = ob.get("Tags", [])
+
+        return self
 
 
 class ColoredFormatter(logging.Formatter):
